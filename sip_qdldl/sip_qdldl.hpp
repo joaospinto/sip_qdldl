@@ -113,6 +113,8 @@ struct MiscellaneousWorkspace {
   double *g_plus_s_plus_e;
   // Stores the linear system residual.
   double *lin_sys_residual;
+  // Stores the z-component of the linear system residual (only in 2x2 mode).
+  double *z_residual;
   // Stores the x-gradient of the Lagrangian.
   double *grad_x_lagrangian;
   // Stores sigma = z / (s + gamma_z * z).

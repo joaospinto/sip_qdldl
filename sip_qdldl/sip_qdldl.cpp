@@ -230,14 +230,6 @@ void compute_search_direction_4x4(const Input &input, const Settings &settings,
       lhs, workspace.qdldl_workspace.x,
       workspace.miscellaneous_workspace.lin_sys_residual);
 
-  output.lin_sys_error = 0.0;
-
-  for (int i = 0; i < dim; ++i) {
-    output.lin_sys_error = std::max(
-        output.lin_sys_error,
-        std::fabs(workspace.miscellaneous_workspace.lin_sys_residual[i]));
-  }
-
   if (settings.permute_kkt_system) {
     for (int i = 0; i < x_dim; ++i) {
       output.dx[i] = workspace.qdldl_workspace.x[settings.kkt_pinv[i]];
@@ -289,6 +281,23 @@ void compute_search_direction_4x4(const Input &input, const Settings &settings,
     for (int i = 0; i < s_dim; ++i) {
       const double p = input.p;
       output.de[i] = -input.e[i] - (output.dz[i] + input.z[i]) / p;
+    }
+  }
+
+  output.lin_sys_error = 0.0;
+
+  for (int i = 0; i < dim; ++i) {
+    output.lin_sys_error = std::max(
+        output.lin_sys_error,
+        std::fabs(workspace.miscellaneous_workspace.lin_sys_residual[i]));
+  }
+
+  if (settings.enable_elastics) {
+    for (int i = 0; i < s_dim; ++i) {
+      output.lin_sys_error = std::max(
+          std::fabs((output.dz[i] + output.de[i] + input.z[i]) / input.p +
+                    input.e[i]),
+          output.lin_sys_error);
     }
   }
 }
@@ -519,6 +528,22 @@ void compute_search_direction_3x3(const Input &input, const Settings &settings,
         std::fabs(workspace.miscellaneous_workspace.lin_sys_residual[i]));
   }
 
+  if (settings.enable_elastics) {
+    for (int i = 0; i < s_dim; ++i) {
+      output.lin_sys_error = std::max(
+          std::fabs((output.dz[i] + output.de[i] + input.z[i]) / input.p +
+                    input.e[i]),
+          output.lin_sys_error);
+    }
+  }
+
+  for (int i = 0; i < s_dim; ++i) {
+    output.lin_sys_error =
+        std::max(std::fabs(output.ds[i] * input.z[i] / input.s[i] +
+                           output.dz[i] - input.mu / input.s[i] + input.z[i]),
+                 output.lin_sys_error);
+  }
+
   output.kkt_error = 0.0;
   for (int i = 0; i < x_dim; ++i) {
     output.kkt_error = std::max(
@@ -744,6 +769,40 @@ void compute_search_direction_2x2(const Input &input, const Settings &settings,
         std::fabs(workspace.miscellaneous_workspace.lin_sys_residual[i]));
   }
 
+  if (settings.enable_elastics) {
+    for (int i = 0; i < s_dim; ++i) {
+      output.lin_sys_error = std::max(
+          std::fabs((output.dz[i] + output.de[i] + input.z[i]) / input.p +
+                    input.e[i]),
+          output.lin_sys_error);
+    }
+  }
+
+  if (settings.enable_elastics) {
+    for (int i = 0; i < s_dim; ++i) {
+      workspace.miscellaneous_workspace.z_residual[i] =
+          output.ds[i] - input.r3 * output.dz[i] + output.de[i] / input.p +
+          input.g[i] + input.s[i] + input.e[i];
+    }
+  } else {
+    for (int i = 0; i < s_dim; ++i) {
+      workspace.miscellaneous_workspace.z_residual[i] =
+          output.ds[i] - input.r3 * output.dz[i] + input.g[i] + input.s[i];
+    }
+  }
+
+  add_Ax_to_y(input.G, output.dx, workspace.miscellaneous_workspace.z_residual);
+
+  for (int i = 0; i < s_dim; ++i) {
+    output.lin_sys_error =
+        std::max(std::fabs(output.ds[i] * input.z[i] / input.s[i] +
+                           output.dz[i] - input.mu / input.s[i] + input.z[i]),
+                 output.lin_sys_error);
+    output.lin_sys_error =
+        std::max(std::fabs(workspace.miscellaneous_workspace.z_residual[i]),
+                 output.lin_sys_error);
+  }
+
   output.kkt_error = 0.0;
   for (int i = 0; i < x_dim; ++i) {
     output.kkt_error = std::max(
@@ -867,6 +926,7 @@ void MiscellaneousWorkspace::reserve(int x_dim, int s_dim, int kkt_dim,
                                      int upper_jac_g_t_jac_g_nnz) {
   g_plus_s = new double[s_dim];
   lin_sys_residual = new double[kkt_dim];
+  z_residual = new double[s_dim];
   grad_x_lagrangian = new double[x_dim];
   sigma = new double[s_dim];
   sigma_times_g_plus_mu_over_z_minus_z_over_p = new double[s_dim];
@@ -877,6 +937,7 @@ void MiscellaneousWorkspace::reserve(int x_dim, int s_dim, int kkt_dim,
 void MiscellaneousWorkspace::free() {
   delete[] g_plus_s;
   delete[] lin_sys_residual;
+  delete[] z_residual;
   delete[] grad_x_lagrangian;
   delete[] sigma;
   delete[] sigma_times_g_plus_mu_over_z_minus_z_over_p;
@@ -895,6 +956,9 @@ auto MiscellaneousWorkspace::mem_assign(int x_dim, int s_dim, int kkt_dim,
   lin_sys_residual =
       reinterpret_cast<decltype(lin_sys_residual)>(mem_ptr + cum_size);
   cum_size += kkt_dim * sizeof(double);
+
+  z_residual = reinterpret_cast<decltype(z_residual)>(mem_ptr + cum_size);
+  cum_size += s_dim * sizeof(double);
 
   grad_x_lagrangian =
       reinterpret_cast<decltype(grad_x_lagrangian)>(mem_ptr + cum_size);
