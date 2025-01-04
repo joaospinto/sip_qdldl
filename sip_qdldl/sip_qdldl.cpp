@@ -2,332 +2,51 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cmath>
-#include <limits>
-#include <utility>
 
 #include <qdldl.h>
 
 namespace sip_qdldl {
 
-auto get_s_dim(const ConstSparseMatrix &jacobian_g) -> int {
-  return jacobian_g.is_transposed ? jacobian_g.cols : jacobian_g.rows;
+CallbackProvider::CallbackProvider(ConstSparseMatrix upper_H_pattern,
+                                   ConstSparseMatrix C_pattern,
+                                   ConstSparseMatrix G_pattern,
+                                   const Settings &settings,
+                                   Workspace &workspace)
+    : upper_H_pattern_(upper_H_pattern), C_pattern_(C_pattern),
+      G_pattern_(G_pattern), settings_(settings), workspace_(workspace) {
+  assert(C_pattern.is_transposed);
+  assert(G_pattern.is_transposed);
 }
 
-auto get_y_dim(const ConstSparseMatrix &jacobian_c) -> int {
-  return jacobian_c.is_transposed ? jacobian_c.cols : jacobian_c.rows;
+int CallbackProvider::get_x_dim() const { return upper_H_pattern_.rows; }
+
+int CallbackProvider::get_y_dim() const {
+  return C_pattern_.is_transposed ? C_pattern_.cols : C_pattern_.rows;
 }
 
-void build_lhs_4x4(const Input &input, const Settings &settings,
-                   Workspace &workspace) {
-  // Builds the following matrix in CSC format:
-  // [ H       0         C.T              G.T       ]
-  // [ 0   S^{-1} Z       0               I_s       ]
-  // [ 0       0      -r2 * I_y            0        ]
-  // [ 0       0          0       -(r3 + 1/p) * I_z ]
-  const int x_dim = input.H.rows;
-  const int s_dim = get_s_dim(input.G);
-  const int y_dim = get_y_dim(input.C);
-
-  const double *s = input.s;
-  const double *z = input.z;
-
-  auto &lhs = workspace.kkt_workspace.lhs;
-
-  lhs.rows = x_dim + 2 * s_dim + y_dim;
-  lhs.cols = lhs.rows;
-  lhs.is_transposed = false;
-
-  int k = 0;
-
-  // Fill upper_hessian_f.
-  for (int i = 0; i < x_dim; ++i) {
-    lhs.indptr[i] = k;
-    for (int j = input.H.indptr[i]; j < input.H.indptr[i + 1]; ++j) {
-      if (input.H.ind[j] <= i) {
-        lhs.ind[k] = input.H.ind[j];
-        lhs.data[k] = input.H.data[j];
-        ++k;
-      }
-    }
-  }
-
-  // Fill S^{-1} Z.
-  for (int i = 0; i < s_dim; ++i) {
-    lhs.indptr[x_dim + i] = k;
-    lhs.ind[k] = x_dim + i;
-    lhs.data[k] = z[i] / s[i];
-    ++k;
-  }
-
-  // Fill jacobian_c_t and -gamma_y * I_y.
-  for (int i = 0; i < y_dim; ++i) {
-    lhs.indptr[x_dim + s_dim + i] = k;
-    // Fill jacobian_c_t column.
-    // NOTE: input.C.is_transposed == true.
-    for (int j = input.C.indptr[i]; j < input.C.indptr[i + 1]; ++j) {
-      lhs.ind[k] = input.C.ind[j];
-      lhs.data[k] = input.C.data[j];
-      ++k;
-    }
-    // Fill -gamma_y * I_y column.
-    lhs.ind[k] = x_dim + s_dim + i;
-    lhs.data[k] = -input.r2;
-    ++k;
-  }
-
-  // Fill jacobian_g, I_s, and -(gamma_z + 1/p) * I_z.
-  for (int i = 0; i < s_dim; ++i) {
-    lhs.indptr[x_dim + s_dim + y_dim + i] = k;
-    // Fill jacobian_g column.
-    // NOTE: input.G.is_transposed == true.
-    for (int j = input.G.indptr[i]; j < input.G.indptr[i + 1]; ++j) {
-      lhs.ind[k] = input.G.ind[j];
-      lhs.data[k] = input.G.data[j];
-      ++k;
-    }
-    // Fill I_s column.
-    lhs.ind[k] = x_dim + i;
-    lhs.data[k] = 1.0;
-    ++k;
-    // Fill -(gamma_z + 1 / p) * I_z column.
-    lhs.ind[k] = x_dim + s_dim + y_dim + i;
-    lhs.data[k] = -input.r3 - (settings.enable_elastics ? 1.0 / input.p : 0.0);
-    ++k;
-  }
-
-  lhs.indptr[x_dim + y_dim + 2 * s_dim] = k;
+int CallbackProvider::get_z_dim() const {
+  return G_pattern_.is_transposed ? G_pattern_.cols : G_pattern_.rows;
 }
 
-void build_nrhs_4x4(const Input &input, const Settings &settings,
-                    Workspace &workspace) {
-  // Builds the following vector:
-  // [ grad_f + C.T @ y + G.T @ z ]
-  // [      z - input.mu / s      ]
-  // [             c              ]
-  // [       g + s - z / p        ]
-  const double *s = input.s;
-  const double *y = input.y;
-  const double *z = input.z;
-
-  const int x_dim = input.H.cols;
-  const int s_dim = get_s_dim(input.G);
-  const int y_dim = get_y_dim(input.C);
-
-  double *nrhs = workspace.kkt_workspace.negative_rhs;
-
-  std::copy(input.grad_f, input.grad_f + x_dim, nrhs);
-
-  add_ATx_to_y(input.C, y, nrhs);
-  add_ATx_to_y(input.G, z, nrhs);
-
-  for (int i = 0; i < s_dim; ++i) {
-    nrhs[x_dim + i] = z[i] - input.mu / s[i];
-  }
-
-  for (int i = 0; i < y_dim; ++i) {
-    nrhs[x_dim + s_dim + i] = input.c[i];
-  }
-
-  if (settings.enable_elastics) {
-    for (int i = 0; i < s_dim; ++i) {
-      workspace.miscellaneous_workspace.g_plus_s[i] = input.g[i] + input.s[i];
-      nrhs[x_dim + s_dim + y_dim + i] =
-          workspace.miscellaneous_workspace.g_plus_s[i] - z[i] / input.p;
-    }
-  } else {
-    for (int i = 0; i < s_dim; ++i) {
-      workspace.miscellaneous_workspace.g_plus_s[i] = input.g[i] + input.s[i];
-      nrhs[x_dim + s_dim + y_dim + i] =
-          workspace.miscellaneous_workspace.g_plus_s[i];
-    }
-  }
+int CallbackProvider::get_kkt_dim() const {
+  return get_x_dim() + get_y_dim() + get_z_dim();
 }
 
-void compute_search_direction_4x4(const Input &input, const Settings &settings,
-                                  Workspace &workspace, Output &output) {
-  build_lhs_4x4(input, settings, workspace);
-  build_nrhs_4x4(input, settings, workspace);
+void CallbackProvider::build_lhs(const double *upper_H_data,
+                                 const double *C_data, const double *G_data,
+                                 const double *w, const double r1,
+                                 const double r2, const double r3) {
+  // This function builds the following matrix in CSC format:
+  // [ H + r1 I     C.T          G.T    ]
+  // [    0      -r2 * I_y        0     ]
+  // [    0          0        -W - r3 I ]
+  const int x_dim = get_x_dim();
+  const int y_dim = get_y_dim();
+  const int z_dim = get_z_dim();
 
-  if (settings.permute_kkt_system) {
-    assert(settings.kkt_p != nullptr);
-    assert(settings.kkt_pinv != nullptr);
-    int *AtoC = nullptr;
-    permute(workspace.kkt_workspace.lhs, settings.kkt_pinv,
-            workspace.miscellaneous_workspace.permutation_workspace, AtoC,
-            workspace.kkt_workspace.permuted_lhs);
-  }
+  SparseMatrix &lhs = workspace_.kkt_workspace.lhs;
 
-  const auto &lhs = settings.permute_kkt_system
-                        ? workspace.kkt_workspace.permuted_lhs
-                        : workspace.kkt_workspace.lhs;
-
-  const int x_dim = input.H.cols;
-  const int s_dim = get_s_dim(input.G);
-  const int y_dim = get_y_dim(input.C);
-
-  output.kkt_error = 0.0;
-  for (int i = 0; i < x_dim; ++i) {
-    output.kkt_error = std::max(
-        output.kkt_error, std::fabs(workspace.kkt_workspace.negative_rhs[i]));
-  }
-  for (int i = 0; i < y_dim; ++i) {
-    output.kkt_error = std::max(output.kkt_error, std::fabs(input.c[i]));
-  }
-  if (settings.enable_elastics) {
-    for (int i = 0; i < s_dim; ++i) {
-      output.kkt_error =
-          std::max(output.kkt_error,
-                   std::fabs(workspace.miscellaneous_workspace.g_plus_s[i] +
-                             input.e[i]));
-    }
-  } else {
-    for (int i = 0; i < s_dim; ++i) {
-      output.kkt_error =
-          std::max(output.kkt_error,
-                   std::fabs(workspace.miscellaneous_workspace.g_plus_s[i]));
-    }
-  }
-
-  const int dim = x_dim + y_dim + 2 * s_dim;
-
-  [[maybe_unused]] const int sumLnz = QDLDL_etree(
-      lhs.rows, lhs.indptr, lhs.ind, workspace.qdldl_workspace.iwork,
-      workspace.qdldl_workspace.Lnz, workspace.qdldl_workspace.etree);
-
-  assert(sumLnz >= 0);
-
-  [[maybe_unused]] const int num_pos_D_entries = QDLDL_factor(
-      dim, lhs.indptr, lhs.ind, lhs.data, workspace.qdldl_workspace.Lp,
-      workspace.qdldl_workspace.Li, workspace.qdldl_workspace.Lx,
-      workspace.qdldl_workspace.D, workspace.qdldl_workspace.Dinv,
-      workspace.qdldl_workspace.Lnz, workspace.qdldl_workspace.etree,
-      workspace.qdldl_workspace.bwork, workspace.qdldl_workspace.iwork,
-      workspace.qdldl_workspace.fwork);
-
-  assert(num_pos_D_entries >= 0);
-
-  if (settings.permute_kkt_system) {
-    for (int i = 0; i < dim; ++i) {
-      workspace.qdldl_workspace.x[i] =
-          -workspace.kkt_workspace.negative_rhs[settings.kkt_p[i]];
-      workspace.miscellaneous_workspace.lin_sys_residual[i] =
-          -workspace.qdldl_workspace.x[i];
-    }
-  } else {
-    for (int i = 0; i < dim; ++i) {
-      workspace.qdldl_workspace.x[i] = -workspace.kkt_workspace.negative_rhs[i];
-      workspace.miscellaneous_workspace.lin_sys_residual[i] =
-          -workspace.qdldl_workspace.x[i];
-    }
-  }
-
-  QDLDL_solve(dim, workspace.qdldl_workspace.Lp, workspace.qdldl_workspace.Li,
-              workspace.qdldl_workspace.Lx, workspace.qdldl_workspace.Dinv,
-              workspace.qdldl_workspace.x);
-
-  add_Ax_to_y_where_A_upper_symmetric(
-      lhs, workspace.qdldl_workspace.x,
-      workspace.miscellaneous_workspace.lin_sys_residual);
-
-  if (settings.permute_kkt_system) {
-    for (int i = 0; i < x_dim; ++i) {
-      output.dx[i] = workspace.qdldl_workspace.x[settings.kkt_pinv[i]];
-    }
-
-    int offset = x_dim;
-
-    for (int i = 0; i < s_dim; ++i) {
-      output.ds[i] = workspace.qdldl_workspace.x[settings.kkt_pinv[offset + i]];
-    }
-
-    offset += s_dim;
-
-    for (int i = 0; i < y_dim; ++i) {
-      output.dy[i] = workspace.qdldl_workspace.x[settings.kkt_pinv[offset + i]];
-    }
-
-    offset += y_dim;
-
-    for (int i = 0; i < s_dim; ++i) {
-      output.dz[i] = workspace.qdldl_workspace.x[settings.kkt_pinv[offset + i]];
-    }
-  } else {
-    for (int i = 0; i < x_dim; ++i) {
-      output.dx[i] = workspace.qdldl_workspace.x[i];
-    }
-
-    int offset = x_dim;
-
-    for (int i = 0; i < s_dim; ++i) {
-      output.ds[i] = workspace.qdldl_workspace.x[offset + i];
-    }
-
-    offset += s_dim;
-
-    for (int i = 0; i < y_dim; ++i) {
-      output.dy[i] = workspace.qdldl_workspace.x[offset + i];
-    }
-
-    offset += y_dim;
-
-    for (int i = 0; i < s_dim; ++i) {
-      output.dz[i] = workspace.qdldl_workspace.x[offset + i];
-    }
-  }
-
-  // de = -e - (dz + z) / p
-  if (settings.enable_elastics) {
-    for (int i = 0; i < s_dim; ++i) {
-      const double p = input.p;
-      output.de[i] = -input.e[i] - (output.dz[i] + input.z[i]) / p;
-    }
-  }
-
-  output.lin_sys_error = 0.0;
-
-  for (int i = 0; i < dim; ++i) {
-    output.lin_sys_error = std::max(
-        output.lin_sys_error,
-        std::fabs(workspace.miscellaneous_workspace.lin_sys_residual[i]));
-  }
-
-  if (settings.enable_elastics) {
-    for (int i = 0; i < s_dim; ++i) {
-      output.lin_sys_error = std::max(
-          std::fabs((output.dz[i] + output.de[i] + input.z[i]) / input.p +
-                    input.e[i]),
-          output.lin_sys_error);
-    }
-  }
-}
-
-void build_lhs_3x3(const Input &input, const Settings &settings,
-                   Workspace &workspace) {
-  // Builds the following matrix in CSC format:
-  // [ H      C.T          G.T     ]
-  // [ 0   -r2 * I_y        0      ]
-  // [ 0       0       -sigma^{-1} ]
-  // Above, sigma = np.diag(z / (s + (gamma_z + 1/p) * z)).
-  const int x_dim = input.H.rows;
-  const int s_dim = get_s_dim(input.G);
-  const int y_dim = get_y_dim(input.C);
-
-  const double *s = input.s;
-  const double *z = input.z;
-
-  double *sigma = workspace.miscellaneous_workspace.sigma;
-
-  for (int i = 0; i < s_dim; ++i) {
-    sigma[i] =
-        z[i] /
-        (s[i] +
-         (input.r3 + (settings.enable_elastics ? 1.0 / input.p : 0.0)) * z[i]);
-  }
-
-  SparseMatrix &lhs = workspace.kkt_workspace.lhs;
-
-  lhs.rows = x_dim + y_dim + s_dim;
+  lhs.rows = get_kkt_dim();
   lhs.cols = lhs.rows;
   lhs.is_transposed = false;
 
@@ -335,523 +54,187 @@ void build_lhs_3x3(const Input &input, const Settings &settings,
 
   lhs.indptr[0] = k;
 
-  // Fill upper_hessian_f.
+  // Fill the first block-column (H + r1 I).
   for (int i = 0; i < x_dim; ++i) {
-    for (int j = input.H.indptr[i]; j < input.H.indptr[i + 1]; ++j) {
-      if (input.H.ind[j] <= i) {
-        lhs.ind[k] = input.H.ind[j];
-        lhs.data[k] = input.H.data[j];
+    bool added_r1_term = false;
+    for (int l = upper_H_pattern_.indptr[i]; l < upper_H_pattern_.indptr[i + 1];
+         ++l) {
+      const int j = upper_H_pattern_.ind[l];
+      if (j <= i) {
+        lhs.ind[k] = upper_H_pattern_.ind[l];
+        lhs.data[k] = upper_H_data[l];
+        if (i == upper_H_pattern_.ind[l]) {
+          lhs.data[k] += r1;
+          added_r1_term = true;
+        }
         ++k;
       }
+    }
+    if (!added_r1_term && r1 > 0.0) {
+      lhs.ind[k] = i;
+      lhs.data[k] = r1;
+      ++k;
     }
     lhs.indptr[i + 1] = k;
   }
 
-  // Fill jacobian_c_t and -gamma_y * I_y.
+  // Fill the second block column (C.T and -r2 * I_y).
   for (int i = 0; i < y_dim; ++i) {
-    // Fill jacobian_c_t column.
-    // NOTE: input.C.is_transposed == true.
-    for (int j = input.C.indptr[i]; j < input.C.indptr[i + 1]; ++j) {
-      lhs.ind[k] = input.C.ind[j];
-      lhs.data[k] = input.C.data[j];
+    // Fill C.T column.
+    // NOTE: assumes that C_pattern_.is_transposed == true.
+    for (int j = C_pattern_.indptr[i]; j < C_pattern_.indptr[i + 1]; ++j) {
+      lhs.ind[k] = C_pattern_.ind[j];
+      lhs.data[k] = C_data[j];
       ++k;
     }
-    // Fill -gamma_y * I_y column.
-    lhs.ind[k] = x_dim + i;
-    lhs.data[k] = -input.r2;
+    // Fill -r2 * I_y column.
+    const int row = x_dim + i;
+    lhs.ind[k] = row;
+    lhs.data[k] = -r2;
     ++k;
-    lhs.indptr[x_dim + i + 1] = k;
+    lhs.indptr[row + 1] = k;
   }
 
-  // Fill jacobian_g_t and -sigma^{-1}.
-  for (int i = 0; i < s_dim; ++i) {
-    // Fill jacobian_g_t column.
-    for (int j = input.G.indptr[i]; j < input.G.indptr[i + 1]; ++j) {
-      lhs.ind[k] = input.G.ind[j];
-      lhs.data[k] = input.G.data[j];
+  // Fill the third block-column (G.T and -W - r3 I).
+  for (int i = 0; i < z_dim; ++i) {
+    // Fill G.T column.
+    // NOTE: assumes that G_pattern_.is_transposed == true.
+    for (int j = G_pattern_.indptr[i]; j < G_pattern_.indptr[i + 1]; ++j) {
+      lhs.ind[k] = G_pattern_.ind[j];
+      lhs.data[k] = G_data[j];
       ++k;
     }
-    // Fill -sigma^{-1} column.
-    lhs.ind[k] = x_dim + y_dim + i;
-    lhs.data[k] = -1.0 / sigma[i];
+    // Fill -W - r3 I column.
+    const int row = x_dim + y_dim + i;
+    lhs.ind[k] = row;
+    lhs.data[k] = -w[i] - r3;
     ++k;
-    lhs.indptr[x_dim + y_dim + i + 1] = k;
+    lhs.indptr[row + 1] = k;
   }
 }
 
-void build_nrhs_3x3(const Input &input, const Settings &settings,
-                    Workspace &workspace) {
-  // Builds the following vector:
-  // [ grad_f + C.T @ y + G.T @ z  ]
-  // [              c              ]
-  // [ g(x) + input.mu / z - z / p ]
-  const double *y = input.y;
-  const double *z = input.z;
+void CallbackProvider::ldlt_factor(const double *upper_H_data,
+                                   const double *C_data, const double *G_data,
+                                   const double *w, const double r1,
+                                   const double r2, const double r3,
+                                   double *LT_data, double *D_diag) {
+  build_lhs(upper_H_data, C_data, G_data, w, r1, r2, r3);
 
-  const int x_dim = input.H.cols;
-  const int s_dim = get_s_dim(input.G);
-  const int y_dim = get_y_dim(input.C);
-
-  double *nrhs = workspace.kkt_workspace.negative_rhs;
-
-  std::copy(input.grad_f, input.grad_f + x_dim, nrhs);
-
-  add_ATx_to_y(input.C, y, nrhs);
-  add_ATx_to_y(input.G, z, nrhs);
-
-  for (int i = 0; i < y_dim; ++i) {
-    nrhs[x_dim + i] = input.c[i];
-  }
-
-  for (int i = 0; i < s_dim; ++i) {
-    nrhs[x_dim + y_dim + i] = input.g[i] + input.mu / z[i] -
-                              (settings.enable_elastics ? z[i] / input.p : 0.0);
-  }
-}
-
-void compute_search_direction_3x3(const Input &input, const Settings &settings,
-                                  Workspace &workspace, Output &output) {
-  build_lhs_3x3(input, settings, workspace);
-  build_nrhs_3x3(input, settings, workspace);
-
-  if (settings.permute_kkt_system) {
-    assert(settings.kkt_p != nullptr);
-    assert(settings.kkt_pinv != nullptr);
+  if (settings_.permute_kkt_system) {
+    assert(settings_.kkt_pinv != nullptr);
     int *AtoC = nullptr;
-    permute(workspace.kkt_workspace.lhs, settings.kkt_pinv,
-            workspace.miscellaneous_workspace.permutation_workspace, AtoC,
-            workspace.kkt_workspace.permuted_lhs);
+    permute(workspace_.kkt_workspace.lhs, settings_.kkt_pinv,
+            workspace_.permutation_workspace, AtoC,
+            workspace_.kkt_workspace.permuted_lhs);
   }
 
-  const auto &lhs = settings.permute_kkt_system
-                        ? workspace.kkt_workspace.permuted_lhs
-                        : workspace.kkt_workspace.lhs;
+  const auto &lhs = settings_.permute_kkt_system
+                        ? workspace_.kkt_workspace.permuted_lhs
+                        : workspace_.kkt_workspace.lhs;
 
-  const int x_dim = input.H.cols;
-  const int s_dim = get_s_dim(input.G);
-  const int y_dim = get_y_dim(input.C);
-
-  const int dim = x_dim + s_dim + y_dim;
+  const int kkt_dim = get_kkt_dim();
 
   [[maybe_unused]] const int sumLnz = QDLDL_etree(
-      lhs.rows, lhs.indptr, lhs.ind, workspace.qdldl_workspace.iwork,
-      workspace.qdldl_workspace.Lnz, workspace.qdldl_workspace.etree);
+      lhs.rows, lhs.indptr, lhs.ind, workspace_.qdldl_workspace.iwork,
+      workspace_.qdldl_workspace.Lnz, workspace_.qdldl_workspace.etree);
 
   assert(sumLnz >= 0);
 
   [[maybe_unused]] const int num_pos_D_entries = QDLDL_factor(
-      dim, lhs.indptr, lhs.ind, lhs.data, workspace.qdldl_workspace.Lp,
-      workspace.qdldl_workspace.Li, workspace.qdldl_workspace.Lx,
-      workspace.qdldl_workspace.D, workspace.qdldl_workspace.Dinv,
-      workspace.qdldl_workspace.Lnz, workspace.qdldl_workspace.etree,
-      workspace.qdldl_workspace.bwork, workspace.qdldl_workspace.iwork,
-      workspace.qdldl_workspace.fwork);
+      kkt_dim, lhs.indptr, lhs.ind, lhs.data, workspace_.qdldl_workspace.Lp,
+      workspace_.qdldl_workspace.Li, workspace_.qdldl_workspace.Lx,
+      workspace_.qdldl_workspace.D, workspace_.qdldl_workspace.Dinv,
+      workspace_.qdldl_workspace.Lnz, workspace_.qdldl_workspace.etree,
+      workspace_.qdldl_workspace.bwork, workspace_.qdldl_workspace.iwork,
+      workspace_.qdldl_workspace.fwork);
 
   assert(num_pos_D_entries >= 0);
 
-  if (settings.permute_kkt_system) {
-    for (int i = 0; i < dim; ++i) {
-      workspace.qdldl_workspace.x[i] =
-          -workspace.kkt_workspace.negative_rhs[settings.kkt_p[i]];
-      workspace.miscellaneous_workspace.lin_sys_residual[i] =
-          -workspace.qdldl_workspace.x[i];
+  // NOTE: no need to fill LT_data and D_diag, as we're storing them ourselves.
+  (void)LT_data;
+  (void)D_diag;
+}
+
+void CallbackProvider::ldlt_solve(const double *LT_data, const double *D_diag,
+                                  const double *b, double *v) {
+  // NOTE: no need to read LT_data and D_diag, as we created them ourselves.
+  (void)LT_data;
+  (void)D_diag;
+
+  const int kkt_dim = get_kkt_dim();
+
+  double *solution =
+      settings_.permute_kkt_system ? workspace_.qdldl_workspace.x : v;
+
+  if (settings_.permute_kkt_system) {
+    for (int i = 0; i < kkt_dim; ++i) {
+      solution[settings_.kkt_pinv[i]] = b[i];
     }
   } else {
-    for (int i = 0; i < dim; ++i) {
-      workspace.qdldl_workspace.x[i] = -workspace.kkt_workspace.negative_rhs[i];
-      workspace.miscellaneous_workspace.lin_sys_residual[i] =
-          -workspace.qdldl_workspace.x[i];
-    }
+    std::copy(b, b + kkt_dim, solution);
   }
 
-  QDLDL_solve(dim, workspace.qdldl_workspace.Lp, workspace.qdldl_workspace.Li,
-              workspace.qdldl_workspace.Lx, workspace.qdldl_workspace.Dinv,
-              workspace.qdldl_workspace.x);
+  QDLDL_solve(kkt_dim, workspace_.qdldl_workspace.Lp,
+              workspace_.qdldl_workspace.Li, workspace_.qdldl_workspace.Lx,
+              workspace_.qdldl_workspace.Dinv, solution);
 
-  add_Ax_to_y_where_A_upper_symmetric(
-      lhs, workspace.qdldl_workspace.x,
-      workspace.miscellaneous_workspace.lin_sys_residual);
-
-  if (settings.permute_kkt_system) {
-    for (int i = 0; i < x_dim; ++i) {
-      output.dx[i] = workspace.qdldl_workspace.x[settings.kkt_pinv[i]];
-    }
-
-    int offset = x_dim;
-
-    for (int i = 0; i < y_dim; ++i) {
-      output.dy[i] = workspace.qdldl_workspace.x[settings.kkt_pinv[offset + i]];
-    }
-
-    offset += y_dim;
-
-    for (int i = 0; i < s_dim; ++i) {
-      output.dz[i] = workspace.qdldl_workspace.x[settings.kkt_pinv[offset + i]];
-    }
-  } else {
-    for (int i = 0; i < x_dim; ++i) {
-      output.dx[i] = workspace.qdldl_workspace.x[i];
-    }
-
-    int offset = x_dim;
-
-    for (int i = 0; i < y_dim; ++i) {
-      output.dy[i] = workspace.qdldl_workspace.x[offset + i];
-    }
-
-    offset += y_dim;
-
-    for (int i = 0; i < s_dim; ++i) {
-      output.dz[i] = workspace.qdldl_workspace.x[offset + i];
+  if (settings_.permute_kkt_system) {
+    for (int i = 0; i < kkt_dim; ++i) {
+      v[i] = workspace_.qdldl_workspace.x[settings_.kkt_pinv[i]];
     }
   }
+}
 
-  // ds = -s / z * dz - s + mu / z;
-  for (int i = 0; i < s_dim; ++i) {
-    output.ds[i] = -input.s[i] / input.z[i] * output.dz[i] - input.s[i] +
-                   input.mu / input.z[i];
-  }
-
-  // de = -e - (dz + z) / p
-  if (settings.enable_elastics) {
-    for (int i = 0; i < s_dim; ++i) {
-      const double p = input.p;
-      output.de[i] = -input.e[i] - (output.dz[i] + input.z[i]) / p;
-    }
-  }
-
-  output.lin_sys_error = 0.0;
-
-  for (int i = 0; i < dim; ++i) {
-    output.lin_sys_error = std::max(
-        output.lin_sys_error,
-        std::fabs(workspace.miscellaneous_workspace.lin_sys_residual[i]));
-  }
-
-  if (settings.enable_elastics) {
-    for (int i = 0; i < s_dim; ++i) {
-      output.lin_sys_error = std::max(
-          std::fabs((output.dz[i] + output.de[i] + input.z[i]) / input.p +
-                    input.e[i]),
-          output.lin_sys_error);
-    }
-  }
-
-  for (int i = 0; i < s_dim; ++i) {
-    output.lin_sys_error =
-        std::max(std::fabs(output.ds[i] * input.z[i] / input.s[i] +
-                           output.dz[i] - input.mu / input.s[i] + input.z[i]),
-                 output.lin_sys_error);
-  }
-
-  output.kkt_error = 0.0;
+void CallbackProvider::add_Kx_to_y(const double *upper_H_data,
+                                   const double *C_data, const double *G_data,
+                                   const double *w, const double r1,
+                                   const double r2, const double r3,
+                                   const double *x_x, const double *x_y,
+                                   const double *x_z, double *y_x, double *y_y,
+                                   double *y_z) {
+  add_upper_symmetric_Hx_to_y(upper_H_data, x_x, y_x);
+  add_Cx_to_y(C_data, x_x, y_y);
+  add_CTx_to_y(C_data, x_y, y_x);
+  add_Gx_to_y(G_data, x_x, y_z);
+  add_GTx_to_y(G_data, x_z, y_x);
+  const int x_dim = get_x_dim();
+  const int y_dim = get_y_dim();
+  const int z_dim = get_z_dim();
   for (int i = 0; i < x_dim; ++i) {
-    output.kkt_error = std::max(
-        output.kkt_error, std::fabs(workspace.kkt_workspace.negative_rhs[i]));
+    y_x[i] += r1 * x_x[i];
   }
   for (int i = 0; i < y_dim; ++i) {
-    output.kkt_error = std::max(output.kkt_error, std::fabs(input.c[i]));
+    y_y[i] -= r2 * x_y[i];
   }
-  if (settings.enable_elastics) {
-    for (int i = 0; i < s_dim; ++i) {
-      output.kkt_error = std::max(
-          output.kkt_error, std::fabs(input.g[i] + input.s[i] + input.e[i]));
-    }
-  } else {
-    for (int i = 0; i < s_dim; ++i) {
-      output.kkt_error =
-          std::max(output.kkt_error, std::fabs(input.g[i] + input.s[i]));
-    }
+  for (int i = 0; i < z_dim; ++i) {
+    y_z[i] -= (w[i] + r3) * x_z[i];
   }
 }
 
-void build_lhs_2x2(const Input &input, const Settings &settings,
-                   Workspace &workspace) {
-  // Builds the following matrix in CSC format:
-  // [ H + G.T @ sigma @ G      C.T    ]
-  // [          0            -r2 * I_y ]
-  // Above, sigma = np.diag(z / (s + (gamma_z + 1/p) * z)).
-  const int x_dim = input.H.rows;
-  const int s_dim = get_s_dim(input.G);
-  const int y_dim = get_y_dim(input.C);
-
-  const double *s = input.s;
-  const double *z = input.z;
-
-  SparseMatrix &lhs = workspace.kkt_workspace.lhs;
-
-  double *sigma = workspace.miscellaneous_workspace.sigma;
-
-  for (int i = 0; i < s_dim; ++i) {
-    sigma[i] =
-        z[i] /
-        (s[i] +
-         (input.r3 + (settings.enable_elastics ? 1.0 / input.p : 0.0)) * z[i]);
-  }
-
-  XT_D_X(input.G, sigma, workspace.miscellaneous_workspace.jac_g_t_sigma_jac_g);
-
-  add(input.H, workspace.miscellaneous_workspace.jac_g_t_sigma_jac_g, lhs);
-
-  lhs.rows += y_dim;
-  lhs.cols += y_dim;
-
-  // Fill jacobian_c_t and -gamma_y * I_y.
-  int k = lhs.indptr[x_dim];
-  for (int i = 0; i < y_dim; ++i) {
-    // Fill jacobian_c_t column.
-    // NOTE: input.C.is_transposed == true.
-    for (int j = input.C.indptr[i]; j < input.C.indptr[i + 1]; ++j) {
-      lhs.ind[k] = input.C.ind[j];
-      lhs.data[k] = input.C.data[j];
-      ++k;
-    }
-    // Fill -gamma_y * I_y column.
-    lhs.ind[k] = x_dim + i;
-    lhs.data[k] = -input.r2;
-    ++k;
-    lhs.indptr[x_dim + i + 1] = k;
-  }
-}
-
-void build_nrhs_2x2(const Input &input, const Settings &settings,
-                    Workspace &workspace) {
-  // Builds the following vector:
-  // [ grad_f + C.T @ y + G.T @ z + G.T @ sigma @ (g(x) + (mu / z) - z / p)  ]
-  // [                                    c                                  ]
-  const double *y = input.y;
-  const double *z = input.z;
-
-  const int x_dim = input.H.cols;
-  const int s_dim = get_s_dim(input.G);
-  const int y_dim = get_y_dim(input.C);
-
-  std::copy(input.grad_f, input.grad_f + x_dim,
-            workspace.miscellaneous_workspace.grad_x_lagrangian);
-
-  add_ATx_to_y(input.C, y, workspace.miscellaneous_workspace.grad_x_lagrangian);
-
-  add_ATx_to_y(input.G, z, workspace.miscellaneous_workspace.grad_x_lagrangian);
-
-  double *nrhs = workspace.kkt_workspace.negative_rhs;
-
-  std::copy(workspace.miscellaneous_workspace.grad_x_lagrangian,
-            workspace.miscellaneous_workspace.grad_x_lagrangian + x_dim, nrhs);
-
-  double *sigma = workspace.miscellaneous_workspace.sigma;
-
-  for (int i = 0; i < s_dim; ++i) {
-    workspace.miscellaneous_workspace
-        .sigma_times_g_plus_mu_over_z_minus_z_over_p[i] =
-        sigma[i] * (input.g[i] + input.mu / z[i] -
-                    (settings.enable_elastics ? z[i] / input.p : 0.0));
-  }
-
-  add_ATx_to_y(input.G,
-               workspace.miscellaneous_workspace
-                   .sigma_times_g_plus_mu_over_z_minus_z_over_p,
-               nrhs);
-
-  for (int i = 0; i < y_dim; ++i) {
-    nrhs[x_dim + i] = input.c[i];
-  }
-}
-
-void compute_search_direction_2x2(const Input &input, const Settings &settings,
-                                  Workspace &workspace, Output &output) {
-  build_lhs_2x2(input, settings, workspace);
-  build_nrhs_2x2(input, settings, workspace);
-
-  if (settings.permute_kkt_system) {
-    assert(settings.kkt_p != nullptr);
-    assert(settings.kkt_pinv != nullptr);
-    int *AtoC = nullptr;
-    permute(workspace.kkt_workspace.lhs, settings.kkt_pinv,
-            workspace.miscellaneous_workspace.permutation_workspace, AtoC,
-            workspace.kkt_workspace.permuted_lhs);
-  }
-
-  const auto &lhs = settings.permute_kkt_system
-                        ? workspace.kkt_workspace.permuted_lhs
-                        : workspace.kkt_workspace.lhs;
-
-  const int x_dim = input.H.cols;
-  const int s_dim = get_s_dim(input.G);
-  const int y_dim = get_y_dim(input.C);
-
-  const int dim = x_dim + y_dim;
-
-  [[maybe_unused]] const int sumLnz = QDLDL_etree(
-      lhs.rows, lhs.indptr, lhs.ind, workspace.qdldl_workspace.iwork,
-      workspace.qdldl_workspace.Lnz, workspace.qdldl_workspace.etree);
-
-  assert(sumLnz >= 0);
-
-  [[maybe_unused]] const int num_pos_D_entries = QDLDL_factor(
-      dim, lhs.indptr, lhs.ind, lhs.data, workspace.qdldl_workspace.Lp,
-      workspace.qdldl_workspace.Li, workspace.qdldl_workspace.Lx,
-      workspace.qdldl_workspace.D, workspace.qdldl_workspace.Dinv,
-      workspace.qdldl_workspace.Lnz, workspace.qdldl_workspace.etree,
-      workspace.qdldl_workspace.bwork, workspace.qdldl_workspace.iwork,
-      workspace.qdldl_workspace.fwork);
-
-  assert(num_pos_D_entries >= 0);
-
-  if (settings.permute_kkt_system) {
-    for (int i = 0; i < dim; ++i) {
-      workspace.qdldl_workspace.x[i] =
-          -workspace.kkt_workspace.negative_rhs[settings.kkt_p[i]];
-      workspace.miscellaneous_workspace.lin_sys_residual[i] =
-          -workspace.qdldl_workspace.x[i];
-    }
-  } else {
-    for (int i = 0; i < dim; ++i) {
-      workspace.qdldl_workspace.x[i] = -workspace.kkt_workspace.negative_rhs[i];
-      workspace.miscellaneous_workspace.lin_sys_residual[i] =
-          -workspace.qdldl_workspace.x[i];
-    }
-  }
-
-  QDLDL_solve(dim, workspace.qdldl_workspace.Lp, workspace.qdldl_workspace.Li,
-              workspace.qdldl_workspace.Lx, workspace.qdldl_workspace.Dinv,
-              workspace.qdldl_workspace.x);
-
+void CallbackProvider::add_upper_symmetric_Hx_to_y(const double *upper_H_data,
+                                                   const double *x, double *y) {
   add_Ax_to_y_where_A_upper_symmetric(
-      lhs, workspace.qdldl_workspace.x,
-      workspace.miscellaneous_workspace.lin_sys_residual);
-
-  if (settings.permute_kkt_system) {
-    for (int i = 0; i < x_dim; ++i) {
-      output.dx[i] = workspace.qdldl_workspace.x[settings.kkt_pinv[i]];
-    }
-
-    for (int i = 0; i < y_dim; ++i) {
-      output.dy[i] = workspace.qdldl_workspace.x[settings.kkt_pinv[x_dim + i]];
-    }
-  } else {
-    for (int i = 0; i < x_dim; ++i) {
-      output.dx[i] = workspace.qdldl_workspace.x[i];
-    }
-
-    for (int i = 0; i < y_dim; ++i) {
-      output.dy[i] = workspace.qdldl_workspace.x[x_dim + i];
-    }
-  }
-
-  // dz = sigma @ (g(x) + G @ dx + (mu / z - z / p))
-  for (int i = 0; i < s_dim; ++i) {
-    output.dz[i] = workspace.miscellaneous_workspace
-                       .sigma_times_g_plus_mu_over_z_minus_z_over_p[i];
-  }
-
-  add_weighted_Ax_to_y(input.G, workspace.miscellaneous_workspace.sigma,
-                       output.dx, output.dz);
-
-  // ds = -s / z * dz - s + mu / z;
-  for (int i = 0; i < s_dim; ++i) {
-    output.ds[i] = -input.s[i] / input.z[i] * output.dz[i] - input.s[i] +
-                   input.mu / input.z[i];
-  }
-
-  // de = -e - (dz + z) / p
-  if (settings.enable_elastics) {
-    for (int i = 0; i < s_dim; ++i) {
-      const double p = input.p;
-      output.de[i] = -input.e[i] - (output.dz[i] + input.z[i]) / p;
-    }
-  }
-
-  output.lin_sys_error = 0.0;
-
-  for (int i = 0; i < dim; ++i) {
-    output.lin_sys_error = std::max(
-        output.lin_sys_error,
-        std::fabs(workspace.miscellaneous_workspace.lin_sys_residual[i]));
-  }
-
-  if (settings.enable_elastics) {
-    for (int i = 0; i < s_dim; ++i) {
-      output.lin_sys_error = std::max(
-          std::fabs((output.dz[i] + output.de[i] + input.z[i]) / input.p +
-                    input.e[i]),
-          output.lin_sys_error);
-    }
-  }
-
-  if (settings.enable_elastics) {
-    for (int i = 0; i < s_dim; ++i) {
-      workspace.miscellaneous_workspace.z_residual[i] =
-          output.ds[i] - input.r3 * output.dz[i] + output.de[i] / input.p +
-          input.g[i] + input.s[i] + input.e[i];
-    }
-  } else {
-    for (int i = 0; i < s_dim; ++i) {
-      workspace.miscellaneous_workspace.z_residual[i] =
-          output.ds[i] - input.r3 * output.dz[i] + input.g[i] + input.s[i];
-    }
-  }
-
-  add_Ax_to_y(input.G, output.dx, workspace.miscellaneous_workspace.z_residual);
-
-  for (int i = 0; i < s_dim; ++i) {
-    output.lin_sys_error =
-        std::max(std::fabs(output.ds[i] * input.z[i] / input.s[i] +
-                           output.dz[i] - input.mu / input.s[i] + input.z[i]),
-                 output.lin_sys_error);
-    output.lin_sys_error =
-        std::max(std::fabs(workspace.miscellaneous_workspace.z_residual[i]),
-                 output.lin_sys_error);
-  }
-
-  output.kkt_error = 0.0;
-  for (int i = 0; i < x_dim; ++i) {
-    output.kkt_error = std::max(
-        output.kkt_error,
-        std::fabs(workspace.miscellaneous_workspace.grad_x_lagrangian[i]));
-  }
-  for (int i = 0; i < y_dim; ++i) {
-    output.kkt_error = std::max(output.kkt_error, std::fabs(input.c[i]));
-  }
-  if (settings.enable_elastics) {
-    for (int i = 0; i < s_dim; ++i) {
-      output.kkt_error = std::max(
-          output.kkt_error, std::fabs(input.g[i] + input.s[i] + input.e[i]));
-    }
-  } else {
-    for (int i = 0; i < s_dim; ++i) {
-      output.kkt_error =
-          std::max(output.kkt_error, std::fabs(input.g[i] + input.s[i]));
-    }
-  }
+      ConstSparseMatrix(upper_H_pattern_, upper_H_data), x, y);
 }
 
-void compute_search_direction(const Input &input, const Settings &settings,
-                              Workspace &workspace, Output &output) {
-  switch (settings.lin_sys_formulation) {
-  case Settings::LinearSystemFormulation::SYMMETRIC_DIRECT_4x4:
-    return compute_search_direction_4x4(input, settings, workspace, output);
-  case Settings::LinearSystemFormulation::SYMMETRIC_INDIRECT_3x3:
-    return compute_search_direction_3x3(input, settings, workspace, output);
-  case Settings::LinearSystemFormulation::SYMMETRIC_INDIRECT_2x2:
-    return compute_search_direction_2x2(input, settings, workspace, output);
-  }
+void CallbackProvider::add_Cx_to_y(const double *C_data, const double *x,
+                                   double *y) {
+  add_Ax_to_y(ConstSparseMatrix(C_pattern_, C_data), x, y);
 }
 
-auto check_inputs([[maybe_unused]] const Input &input,
-                  [[maybe_unused]] const Settings &settings) {
-  assert(!settings.enable_elastics || input.p > 0.0);
-  assert(input.C.is_transposed);
-  switch (settings.lin_sys_formulation) {
-  case Settings::LinearSystemFormulation::SYMMETRIC_DIRECT_4x4:
-    assert(input.G.is_transposed);
-    break;
-  case Settings::LinearSystemFormulation::SYMMETRIC_INDIRECT_3x3:
-    assert(input.G.is_transposed);
-    break;
-  case Settings::LinearSystemFormulation::SYMMETRIC_INDIRECT_2x2:
-    assert(!input.G.is_transposed);
-    break;
-  }
+void CallbackProvider::add_CTx_to_y(const double *C_data, const double *x,
+                                    double *y) {
+  add_ATx_to_y(ConstSparseMatrix(C_pattern_, C_data), x, y);
+}
+
+void CallbackProvider::add_Gx_to_y(const double *G_data, const double *x,
+                                   double *y) {
+  add_Ax_to_y(ConstSparseMatrix(G_pattern_, G_data), x, y);
+}
+
+void CallbackProvider::add_GTx_to_y(const double *G_data, const double *x,
+                                    double *y) {
+  add_ATx_to_y(ConstSparseMatrix(G_pattern_, G_data), x, y);
 }
 
 void QDLDLWorkspace::reserve(int kkt_dim, int kkt_L_nnz) {
@@ -922,76 +305,14 @@ auto QDLDLWorkspace::mem_assign(int kkt_dim, int kkt_L_nnz,
   return cum_size;
 }
 
-void MiscellaneousWorkspace::reserve(int x_dim, int s_dim, int kkt_dim,
-                                     int upper_jac_g_t_jac_g_nnz) {
-  g_plus_s = new double[s_dim];
-  lin_sys_residual = new double[kkt_dim];
-  z_residual = new double[s_dim];
-  grad_x_lagrangian = new double[x_dim];
-  sigma = new double[s_dim];
-  sigma_times_g_plus_mu_over_z_minus_z_over_p = new double[s_dim];
-  jac_g_t_sigma_jac_g.reserve(x_dim, upper_jac_g_t_jac_g_nnz);
-  permutation_workspace = new int[kkt_dim];
-}
-
-void MiscellaneousWorkspace::free() {
-  delete[] g_plus_s;
-  delete[] lin_sys_residual;
-  delete[] z_residual;
-  delete[] grad_x_lagrangian;
-  delete[] sigma;
-  delete[] sigma_times_g_plus_mu_over_z_minus_z_over_p;
-  jac_g_t_sigma_jac_g.free();
-  delete[] permutation_workspace;
-}
-
-auto MiscellaneousWorkspace::mem_assign(int x_dim, int s_dim, int kkt_dim,
-                                        int jac_g_t_jac_g_nnz,
-                                        unsigned char *mem_ptr) -> int {
-  int cum_size = 0;
-
-  g_plus_s = reinterpret_cast<decltype(g_plus_s)>(mem_ptr + cum_size);
-  cum_size += s_dim * sizeof(double);
-
-  lin_sys_residual =
-      reinterpret_cast<decltype(lin_sys_residual)>(mem_ptr + cum_size);
-  cum_size += kkt_dim * sizeof(double);
-
-  z_residual = reinterpret_cast<decltype(z_residual)>(mem_ptr + cum_size);
-  cum_size += s_dim * sizeof(double);
-
-  grad_x_lagrangian =
-      reinterpret_cast<decltype(grad_x_lagrangian)>(mem_ptr + cum_size);
-  cum_size += x_dim * sizeof(double);
-
-  sigma = reinterpret_cast<decltype(sigma)>(mem_ptr + cum_size);
-  cum_size += s_dim * sizeof(double);
-
-  sigma_times_g_plus_mu_over_z_minus_z_over_p =
-      reinterpret_cast<decltype(sigma_times_g_plus_mu_over_z_minus_z_over_p)>(
-          mem_ptr + cum_size);
-  cum_size += s_dim * sizeof(double);
-
-  cum_size += jac_g_t_sigma_jac_g.mem_assign(x_dim, jac_g_t_jac_g_nnz,
-                                             mem_ptr + cum_size);
-
-  permutation_workspace =
-      reinterpret_cast<decltype(permutation_workspace)>(mem_ptr + cum_size);
-  cum_size += kkt_dim * sizeof(int);
-
-  return cum_size;
-}
-
 void KKTWorkspace::reserve(int kkt_dim, int kkt_nnz) {
   lhs.reserve(kkt_dim, kkt_nnz);
   permuted_lhs.reserve(kkt_dim, kkt_nnz);
-  negative_rhs = new double[kkt_dim];
 }
 
 void KKTWorkspace::free() {
   lhs.free();
   permuted_lhs.free();
-  delete[] negative_rhs;
 }
 
 auto KKTWorkspace::mem_assign(int kkt_dim, int kkt_nnz, unsigned char *mem_ptr)
@@ -1001,83 +322,31 @@ auto KKTWorkspace::mem_assign(int kkt_dim, int kkt_nnz, unsigned char *mem_ptr)
   cum_size += lhs.mem_assign(kkt_dim, kkt_nnz, mem_ptr + cum_size);
   cum_size += permuted_lhs.mem_assign(kkt_dim, kkt_nnz, mem_ptr + cum_size);
 
-  negative_rhs = reinterpret_cast<decltype(negative_rhs)>(mem_ptr + cum_size);
-  cum_size += kkt_dim * sizeof(double);
-
   return cum_size;
 }
 
-auto get_kkt_dim(Settings::LinearSystemFormulation lin_sys_formulation,
-                 int x_dim, int s_dim, int y_dim) -> int {
-  switch (lin_sys_formulation) {
-  case Settings::LinearSystemFormulation::SYMMETRIC_DIRECT_4x4:
-    return x_dim + 2 * s_dim + y_dim;
-  case Settings::LinearSystemFormulation::SYMMETRIC_INDIRECT_3x3:
-    return x_dim + s_dim + y_dim;
-  case Settings::LinearSystemFormulation::SYMMETRIC_INDIRECT_2x2:
-    return x_dim + y_dim;
-  }
-};
-
-auto get_kkt_nnz(Settings::LinearSystemFormulation lin_sys_formulation,
-                 int upper_hessian_f_nnz, int jacobian_c_nnz,
-                 int jacobian_g_nnz,
-                 int upper_hessian_f_plus_upper_jac_g_t_jac_g_nnz, int s_dim,
-                 int y_dim) {
-  switch (lin_sys_formulation) {
-  case Settings::LinearSystemFormulation::SYMMETRIC_DIRECT_4x4:
-    return upper_hessian_f_nnz + jacobian_c_nnz + jacobian_g_nnz + 3 * s_dim +
-           y_dim;
-  case Settings::LinearSystemFormulation::SYMMETRIC_INDIRECT_3x3:
-    return upper_hessian_f_nnz + jacobian_c_nnz + jacobian_g_nnz + s_dim +
-           y_dim;
-  case Settings::LinearSystemFormulation::SYMMETRIC_INDIRECT_2x2:
-    return upper_hessian_f_plus_upper_jac_g_t_jac_g_nnz + jacobian_c_nnz +
-           y_dim;
-  }
-};
-
-void Workspace::reserve(Settings::LinearSystemFormulation lin_sys_formulation,
-                        int x_dim, int s_dim, int y_dim,
-                        int upper_hessian_f_nnz, int jacobian_c_nnz,
-                        int jacobian_g_nnz, int upper_jac_g_t_jac_g_nnz,
-                        int upper_hessian_f_plus_upper_jac_g_t_jac_g_nnz,
-                        int kkt_L_nnz) {
-  const int kkt_dim = get_kkt_dim(lin_sys_formulation, x_dim, s_dim, y_dim);
-  const int kkt_nnz = get_kkt_nnz(
-      lin_sys_formulation, upper_hessian_f_nnz, jacobian_c_nnz, jacobian_g_nnz,
-      upper_hessian_f_plus_upper_jac_g_t_jac_g_nnz, s_dim, y_dim);
-
+void Workspace::reserve(int kkt_dim, int kkt_nnz, int kkt_L_nnz) {
   kkt_workspace.reserve(kkt_dim, kkt_nnz);
   qdldl_workspace.reserve(kkt_dim, kkt_L_nnz);
-  miscellaneous_workspace.reserve(x_dim, s_dim, kkt_dim,
-                                  upper_jac_g_t_jac_g_nnz);
+  permutation_workspace = new int[kkt_dim];
 }
 
 void Workspace::free() {
   kkt_workspace.free();
   qdldl_workspace.free();
-  miscellaneous_workspace.free();
+  delete[] permutation_workspace;
 }
 
-auto Workspace::mem_assign(
-    Settings::LinearSystemFormulation lin_sys_formulation, int x_dim, int s_dim,
-    int y_dim, int upper_hessian_f_nnz, int jacobian_c_nnz,
-    int jac_g_t_jac_g_nnz, int jacobian_g_nnz,
-    int upper_hessian_f_plus_upper_jac_g_t_jac_g_nnz, int kkt_L_nnz,
-    unsigned char *mem_ptr) -> int {
-  const int kkt_dim = get_kkt_dim(lin_sys_formulation, x_dim, s_dim, y_dim);
-  const int kkt_nnz = get_kkt_nnz(
-      lin_sys_formulation, upper_hessian_f_nnz, jacobian_c_nnz, jacobian_g_nnz,
-      upper_hessian_f_plus_upper_jac_g_t_jac_g_nnz, s_dim, y_dim);
-
+auto Workspace::mem_assign(int kkt_dim, int kkt_nnz, int kkt_L_nnz,
+                           unsigned char *mem_ptr) -> int {
   int cum_size = 0;
 
   cum_size += kkt_workspace.mem_assign(kkt_dim, kkt_nnz, mem_ptr + cum_size);
   cum_size +=
       qdldl_workspace.mem_assign(kkt_dim, kkt_L_nnz, mem_ptr + cum_size);
-  cum_size += miscellaneous_workspace.mem_assign(
-      x_dim, s_dim, kkt_dim, jac_g_t_jac_g_nnz, mem_ptr + cum_size);
+  permutation_workspace =
+      reinterpret_cast<decltype(permutation_workspace)>(mem_ptr + cum_size);
+  cum_size += kkt_dim * sizeof(int);
 
   return cum_size;
 }

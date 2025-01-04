@@ -49,18 +49,14 @@ struct ConstSparseMatrix {
   ConstSparseMatrix(const SparseMatrix &M)
       : rows(M.rows), cols(M.cols), ind(M.ind), indptr(M.indptr), data(M.data),
         is_transposed(M.is_transposed) {}
+
+  ConstSparseMatrix(const ConstSparseMatrix &M, const double *data)
+      : rows(M.rows), cols(M.cols), ind(M.ind), indptr(M.indptr), data(data),
+        is_transposed(M.is_transposed) {}
 };
 
 // Useful for debugging.
 auto operator<<(std::ostream &os, const ConstSparseMatrix &M) -> std::ostream &;
-
-auto add(const ConstSparseMatrix &A, const ConstSparseMatrix &B,
-         SparseMatrix &C) -> void;
-
-auto XT_D_X(const ConstSparseMatrix &X, double *D, SparseMatrix &XT_D_X)
-    -> void;
-
-auto add(const double *x, const double *y, const int dim, double *z) -> void;
 
 auto add_ATx_to_y(const ConstSparseMatrix &A, const double *x, double *y)
     -> void;
@@ -68,13 +64,8 @@ auto add_ATx_to_y(const ConstSparseMatrix &A, const double *x, double *y)
 auto add_Ax_to_y(const ConstSparseMatrix &A, const double *x, double *y)
     -> void;
 
-auto add_weighted_Ax_to_y(const ConstSparseMatrix &A, const double *weights,
-                          const double *x, double *y) -> void;
-
 auto add_Ax_to_y_where_A_upper_symmetric(const ConstSparseMatrix &A,
                                          const double *x, double *y) -> void;
-
-auto dot(const double *x, const double *y, const int dim) -> double;
 
 // NOTE: permutation_workspace should have size dim(A); AtoC is optional.
 auto permute(const ConstSparseMatrix &A, const int *pinv,
