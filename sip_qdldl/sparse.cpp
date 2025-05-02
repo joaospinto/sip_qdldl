@@ -141,7 +141,7 @@ auto permute(const ConstSparseMatrix &A, const int *pinv,
   double *Cx = C.data;
 
   int *w = permutation_workspace;
-  std::fill(w, w + n, 0.0);
+  std::fill(w, w + n, 0);
 
   for (int j = 0; j < n; j++) {
     const int j2 = pinv ? pinv[j] : j;
