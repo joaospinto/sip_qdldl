@@ -113,11 +113,10 @@ void CallbackProvider::build_lhs(const double *upper_H_data,
   }
 }
 
-void CallbackProvider::ldlt_factor(const double *upper_H_data,
-                                   const double *C_data, const double *G_data,
-                                   const double *w, const double r1,
-                                   const double r2, const double r3,
-                                   double *LT_data, double *D_diag) {
+void CallbackProvider::factor(const double *upper_H_data, const double *C_data,
+                              const double *G_data, const double *w,
+                              const double r1, const double r2,
+                              const double r3) {
   build_lhs(upper_H_data, C_data, G_data, w, r1, r2, r3);
 
   if (settings_.permute_kkt_system) {
@@ -149,18 +148,9 @@ void CallbackProvider::ldlt_factor(const double *upper_H_data,
       workspace_.qdldl_workspace.fwork);
 
   assert(num_pos_D_entries >= 0);
-
-  // NOTE: no need to fill LT_data and D_diag, as we're storing them ourselves.
-  (void)LT_data;
-  (void)D_diag;
 }
 
-void CallbackProvider::ldlt_solve(const double *LT_data, const double *D_diag,
-                                  const double *b, double *v) {
-  // NOTE: no need to read LT_data and D_diag, as we created them ourselves.
-  (void)LT_data;
-  (void)D_diag;
-
+void CallbackProvider::solve(const double *b, double *v) {
   const int kkt_dim = get_kkt_dim();
 
   double *solution =

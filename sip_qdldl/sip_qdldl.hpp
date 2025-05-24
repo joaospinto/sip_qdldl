@@ -79,12 +79,10 @@ public:
                    ConstSparseMatrix C_pattern, ConstSparseMatrix G_pattern,
                    const Settings &settings, Workspace &workspace);
 
-  void ldlt_factor(const double *upper_H_data, const double *C_data,
-                   const double *G_data, const double *w, const double r1,
-                   const double r2, const double r3, double *LT_data,
-                   double *D_diag);
-  void ldlt_solve(const double *LT_data, const double *D_diag, const double *b,
-                  double *v);
+  void factor(const double *upper_H_data, const double *C_data,
+              const double *G_data, const double *w, const double r1,
+              const double r2, const double r3);
+  void solve(const double *b, double *v);
   void add_Kx_to_y(const double *upper_H_data, const double *C_data,
                    const double *G_data, const double *w, const double r1,
                    const double r2, const double r3, const double *x_x,
