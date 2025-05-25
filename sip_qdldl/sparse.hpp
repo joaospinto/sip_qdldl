@@ -22,6 +22,11 @@ struct SparseMatrix {
   auto reserve(int dim, int nnz) -> void;
   auto free() -> void;
 
+  // For knowing how much memory to pre-allocate.
+  static constexpr auto num_bytes(int dim, int nnz) -> int {
+    return (nnz + dim + 1) * sizeof(int) + nnz * sizeof(double);
+  }
+
   // For using pre-allocated (possibly statically allocated) memory.
   auto mem_assign(int dim, int nnz, unsigned char *mem_ptr) -> int;
 };
@@ -48,10 +53,6 @@ struct ConstSparseMatrix {
 
   ConstSparseMatrix(const SparseMatrix &M)
       : rows(M.rows), cols(M.cols), ind(M.ind), indptr(M.indptr), data(M.data),
-        is_transposed(M.is_transposed) {}
-
-  ConstSparseMatrix(const ConstSparseMatrix &M, const double *data)
-      : rows(M.rows), cols(M.cols), ind(M.ind), indptr(M.indptr), data(data),
         is_transposed(M.is_transposed) {}
 };
 

@@ -7,34 +7,27 @@
 
 namespace sip_qdldl {
 
-CallbackProvider::CallbackProvider(ConstSparseMatrix upper_H_pattern,
-                                   ConstSparseMatrix C_pattern,
-                                   ConstSparseMatrix G_pattern,
-                                   const Settings &settings,
+CallbackProvider::CallbackProvider(const Settings &settings,
+                                   ModelCallbackOutput &mco,
                                    Workspace &workspace)
-    : upper_H_pattern_(upper_H_pattern), C_pattern_(C_pattern),
-      G_pattern_(G_pattern), settings_(settings), workspace_(workspace) {
-  assert(C_pattern.is_transposed);
-  assert(G_pattern.is_transposed);
+    : settings_(settings), mco_(mco), workspace_(workspace) {
+  assert(mco_.jacobian_c.is_transposed);
+  assert(mco_.jacobian_g.is_transposed);
 }
 
-int CallbackProvider::get_x_dim() const { return upper_H_pattern_.rows; }
-
-int CallbackProvider::get_y_dim() const {
-  return C_pattern_.is_transposed ? C_pattern_.cols : C_pattern_.rows;
+int CallbackProvider::get_x_dim() const {
+  return mco_.upper_hessian_lagrangian.rows;
 }
 
-int CallbackProvider::get_z_dim() const {
-  return G_pattern_.is_transposed ? G_pattern_.cols : G_pattern_.rows;
-}
+int CallbackProvider::get_y_dim() const { return mco_.jacobian_c.cols; }
+
+int CallbackProvider::get_z_dim() const { return mco_.jacobian_g.cols; }
 
 int CallbackProvider::get_kkt_dim() const {
   return get_x_dim() + get_y_dim() + get_z_dim();
 }
 
-void CallbackProvider::build_lhs(const double *upper_H_data,
-                                 const double *C_data, const double *G_data,
-                                 const double *w, const double r1,
+void CallbackProvider::build_lhs(const double *w, const double r1,
                                  const double r2, const double r3) {
   // This function builds the following matrix in CSC format:
   // [ H + r1 I     C.T          G.T    ]
@@ -57,13 +50,13 @@ void CallbackProvider::build_lhs(const double *upper_H_data,
   // Fill the first block-column (H + r1 I).
   for (int i = 0; i < x_dim; ++i) {
     bool added_r1_term = false;
-    for (int l = upper_H_pattern_.indptr[i]; l < upper_H_pattern_.indptr[i + 1];
-         ++l) {
-      const int j = upper_H_pattern_.ind[l];
+    for (int l = mco_.upper_hessian_lagrangian.indptr[i];
+         l < mco_.upper_hessian_lagrangian.indptr[i + 1]; ++l) {
+      const int j = mco_.upper_hessian_lagrangian.ind[l];
       if (j <= i) {
-        lhs.ind[k] = upper_H_pattern_.ind[l];
-        lhs.data[k] = upper_H_data[l];
-        if (i == upper_H_pattern_.ind[l]) {
+        lhs.ind[k] = mco_.upper_hessian_lagrangian.ind[l];
+        lhs.data[k] = mco_.upper_hessian_lagrangian.data[l];
+        if (i == mco_.upper_hessian_lagrangian.ind[l]) {
           lhs.data[k] += r1;
           added_r1_term = true;
         }
@@ -81,10 +74,11 @@ void CallbackProvider::build_lhs(const double *upper_H_data,
   // Fill the second block column (C.T and -r2 * I_y).
   for (int i = 0; i < y_dim; ++i) {
     // Fill C.T column.
-    // NOTE: assumes that C_pattern_.is_transposed == true.
-    for (int j = C_pattern_.indptr[i]; j < C_pattern_.indptr[i + 1]; ++j) {
-      lhs.ind[k] = C_pattern_.ind[j];
-      lhs.data[k] = C_data[j];
+    // NOTE: assumes that mco_.jacobian_c.is_transposed == true.
+    for (int j = mco_.jacobian_c.indptr[i]; j < mco_.jacobian_c.indptr[i + 1];
+         ++j) {
+      lhs.ind[k] = mco_.jacobian_c.ind[j];
+      lhs.data[k] = mco_.jacobian_c.data[j];
       ++k;
     }
     // Fill -r2 * I_y column.
@@ -98,10 +92,11 @@ void CallbackProvider::build_lhs(const double *upper_H_data,
   // Fill the third block-column (G.T and -W - r3 I).
   for (int i = 0; i < z_dim; ++i) {
     // Fill G.T column.
-    // NOTE: assumes that G_pattern_.is_transposed == true.
-    for (int j = G_pattern_.indptr[i]; j < G_pattern_.indptr[i + 1]; ++j) {
-      lhs.ind[k] = G_pattern_.ind[j];
-      lhs.data[k] = G_data[j];
+    // NOTE: assumes that mco_.jacobian_g.is_transposed == true.
+    for (int j = mco_.jacobian_g.indptr[i]; j < mco_.jacobian_g.indptr[i + 1];
+         ++j) {
+      lhs.ind[k] = mco_.jacobian_g.ind[j];
+      lhs.data[k] = mco_.jacobian_g.data[j];
       ++k;
     }
     // Fill -W - r3 I column.
@@ -113,11 +108,9 @@ void CallbackProvider::build_lhs(const double *upper_H_data,
   }
 }
 
-void CallbackProvider::factor(const double *upper_H_data, const double *C_data,
-                              const double *G_data, const double *w,
-                              const double r1, const double r2,
+void CallbackProvider::factor(const double *w, const double r1, const double r2,
                               const double r3) {
-  build_lhs(upper_H_data, C_data, G_data, w, r1, r2, r3);
+  build_lhs(w, r1, r2, r3);
 
   if (settings_.permute_kkt_system) {
     assert(settings_.kkt_pinv != nullptr);
@@ -175,18 +168,16 @@ void CallbackProvider::solve(const double *b, double *v) {
   }
 }
 
-void CallbackProvider::add_Kx_to_y(const double *upper_H_data,
-                                   const double *C_data, const double *G_data,
-                                   const double *w, const double r1,
+void CallbackProvider::add_Kx_to_y(const double *w, const double r1,
                                    const double r2, const double r3,
                                    const double *x_x, const double *x_y,
                                    const double *x_z, double *y_x, double *y_y,
                                    double *y_z) {
-  add_upper_symmetric_Hx_to_y(upper_H_data, x_x, y_x);
-  add_Cx_to_y(C_data, x_x, y_y);
-  add_CTx_to_y(C_data, x_y, y_x);
-  add_Gx_to_y(G_data, x_x, y_z);
-  add_GTx_to_y(G_data, x_z, y_x);
+  add_Hx_to_y(x_x, y_x);
+  add_Cx_to_y(x_x, y_y);
+  add_CTx_to_y(x_y, y_x);
+  add_Gx_to_y(x_x, y_z);
+  add_GTx_to_y(x_z, y_x);
   const int x_dim = get_x_dim();
   const int y_dim = get_y_dim();
   const int z_dim = get_z_dim();
@@ -201,30 +192,24 @@ void CallbackProvider::add_Kx_to_y(const double *upper_H_data,
   }
 }
 
-void CallbackProvider::add_upper_symmetric_Hx_to_y(const double *upper_H_data,
-                                                   const double *x, double *y) {
-  add_Ax_to_y_where_A_upper_symmetric(
-      ConstSparseMatrix(upper_H_pattern_, upper_H_data), x, y);
+void CallbackProvider::add_Hx_to_y(const double *x, double *y) {
+  add_Ax_to_y_where_A_upper_symmetric(mco_.upper_hessian_lagrangian, x, y);
 }
 
-void CallbackProvider::add_Cx_to_y(const double *C_data, const double *x,
-                                   double *y) {
-  add_Ax_to_y(ConstSparseMatrix(C_pattern_, C_data), x, y);
+void CallbackProvider::add_Cx_to_y(const double *x, double *y) {
+  add_Ax_to_y(mco_.jacobian_c, x, y);
 }
 
-void CallbackProvider::add_CTx_to_y(const double *C_data, const double *x,
-                                    double *y) {
-  add_ATx_to_y(ConstSparseMatrix(C_pattern_, C_data), x, y);
+void CallbackProvider::add_CTx_to_y(const double *x, double *y) {
+  add_ATx_to_y(mco_.jacobian_c, x, y);
 }
 
-void CallbackProvider::add_Gx_to_y(const double *G_data, const double *x,
-                                   double *y) {
-  add_Ax_to_y(ConstSparseMatrix(G_pattern_, G_data), x, y);
+void CallbackProvider::add_Gx_to_y(const double *x, double *y) {
+  add_Ax_to_y(mco_.jacobian_g, x, y);
 }
 
-void CallbackProvider::add_GTx_to_y(const double *G_data, const double *x,
-                                    double *y) {
-  add_ATx_to_y(ConstSparseMatrix(G_pattern_, G_data), x, y);
+void CallbackProvider::add_GTx_to_y(const double *x, double *y) {
+  add_ATx_to_y(mco_.jacobian_g, x, y);
 }
 
 void QDLDLWorkspace::reserve(int kkt_dim, int kkt_L_nnz) {
@@ -337,6 +322,74 @@ auto Workspace::mem_assign(int kkt_dim, int kkt_nnz, int kkt_L_nnz,
   permutation_workspace =
       reinterpret_cast<decltype(permutation_workspace)>(mem_ptr + cum_size);
   cum_size += kkt_dim * sizeof(int);
+
+  return cum_size;
+}
+
+void ModelCallbackOutput::reserve(int x_dim, int s_dim, int y_dim,
+                                  int upper_hessian_lagrangian_nnz,
+                                  int jacobian_c_nnz, int jacobian_g_nnz,
+                                  bool is_jacobian_c_transposed,
+                                  bool is_jacobian_g_transposed) {
+  gradient_f = new double[x_dim];
+  upper_hessian_lagrangian.reserve(x_dim, upper_hessian_lagrangian_nnz);
+  c = new double[y_dim];
+  if (is_jacobian_c_transposed) {
+    jacobian_c.reserve(y_dim, jacobian_c_nnz);
+  } else {
+    jacobian_c.reserve(x_dim, jacobian_c_nnz);
+  }
+  g = new double[s_dim];
+  if (is_jacobian_g_transposed) {
+    jacobian_g.reserve(s_dim, jacobian_g_nnz);
+  } else {
+    jacobian_g.reserve(x_dim, jacobian_g_nnz);
+  }
+}
+
+void ModelCallbackOutput::free() {
+  delete[] gradient_f;
+  upper_hessian_lagrangian.free();
+  delete[] c;
+  jacobian_c.free();
+  delete[] g;
+  jacobian_g.free();
+}
+
+auto ModelCallbackOutput::mem_assign(int x_dim, int s_dim, int y_dim,
+                                     int upper_hessian_lagrangian_nnz,
+                                     int jacobian_c_nnz, int jacobian_g_nnz,
+                                     bool is_jacobian_c_transposed,
+                                     bool is_jacobian_g_transposed,
+                                     unsigned char *mem_ptr) -> int {
+  int cum_size = 0;
+  gradient_f = reinterpret_cast<decltype(gradient_f)>(mem_ptr + cum_size);
+  cum_size += x_dim * sizeof(double);
+
+  cum_size += upper_hessian_lagrangian.mem_assign(
+      x_dim, upper_hessian_lagrangian_nnz, mem_ptr + cum_size);
+
+  c = reinterpret_cast<decltype(c)>(mem_ptr + cum_size);
+  cum_size += y_dim * sizeof(double);
+
+  if (is_jacobian_c_transposed) {
+    cum_size +=
+        jacobian_c.mem_assign(y_dim, jacobian_c_nnz, mem_ptr + cum_size);
+  } else {
+    cum_size +=
+        jacobian_c.mem_assign(x_dim, jacobian_c_nnz, mem_ptr + cum_size);
+  }
+
+  g = reinterpret_cast<decltype(g)>(mem_ptr + cum_size);
+  cum_size += s_dim * sizeof(double);
+
+  if (is_jacobian_g_transposed) {
+    cum_size +=
+        jacobian_g.mem_assign(s_dim, jacobian_g_nnz, mem_ptr + cum_size);
+  } else {
+    cum_size +=
+        jacobian_g.mem_assign(x_dim, jacobian_g_nnz, mem_ptr + cum_size);
+  }
 
   return cum_size;
 }
