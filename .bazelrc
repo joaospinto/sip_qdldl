@@ -18,7 +18,6 @@ build:windows --cxxopt=/O2
 build:windows --cxxopt=/utf-8
 
 build -c opt
-build --cxxopt=-O3
 
 common --enable_platform_specific_config
 
